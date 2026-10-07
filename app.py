@@ -3,7 +3,7 @@ Engineering Intelligence Hub
 Jira + GitLab analytics for Scrum Masters, Project / Program Managers,
 Engineering Managers and Delivery Leads.
 
-Run:  streamlit run engineering_hub.py
+Run:  streamlit run claude2.py
 """
 import html
 import json
@@ -329,6 +329,21 @@ class GitLabPipelineDTO:
     web_url: str
 
 
+@dataclass
+class GitLabIssueDTO:
+    issue_id: int
+    title: str
+    state: str
+    author: str
+    assignees: str
+    labels: str
+    created_at: str
+    updated_at: str
+    closed_at: Optional[str]
+    due_date: Optional[str]
+    web_url: str
+
+
 # =====================================================================
 # 4. HTTP CLIENT
 # =====================================================================
@@ -628,12 +643,29 @@ class GitLabService:
             web_url=p.get("web_url", ""),
         )
 
+    @staticmethod
+    def _issue(issue: Dict[str, Any]) -> GitLabIssueDTO:
+        return GitLabIssueDTO(
+            issue_id=issue.get("iid"),
+            title=issue.get("title", ""),
+            state=issue.get("state", ""),
+            author=(issue.get("author") or {}).get("username", "unknown"),
+            assignees=", ".join(a.get("username", "") for a in issue.get("assignees") or []),
+            labels=", ".join(issue.get("labels") or []),
+            created_at=(issue.get("created_at") or "")[:19],
+            updated_at=(issue.get("updated_at") or "")[:19],
+            closed_at=(issue.get("closed_at") or "")[:19] or None,
+            due_date=issue.get("due_date"),
+            web_url=issue.get("web_url", ""),
+        )
+
     def fetch_deep_telemetry(
         self,
         project_id: int,
         max_mrs: int = 300,
         max_commits: int = 500,
         max_pipelines: int = 200,
+        max_issues: int = 200,
         since_days: Optional[int] = 90,
     ) -> Dict[str, Any]:
         since = None
@@ -664,6 +696,13 @@ class GitLabService:
             rows = self._paginate(f"/api/v4/projects/{pid}/pipelines", params, max_pipelines)
             return [self._pipeline(r) for r in rows]
 
+        def fetch_issues():
+            params: Dict[str, Any] = {"state": "all", "order_by": "updated_at", "sort": "desc"}
+            if since:
+                params["updated_after"] = since
+            rows = self._paginate(f"/api/v4/projects/{pid}/issues", params, max_issues)
+            return [self._issue(r) for r in rows]
+
         def safe(label: str, fn):
             try:
                 return fn(), None
@@ -675,8 +714,9 @@ class GitLabService:
             "Merge requests": fetch_mrs,
             "Commits": fetch_commits,
             "Pipelines": fetch_pipelines,
+            "Issues": fetch_issues,
         }
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {n: executor.submit(safe, n, fn) for n, fn in tasks.items()}
             results = {n: f.result() for n, f in futures.items()}
 
@@ -684,6 +724,7 @@ class GitLabService:
             "merge_requests": [asdict(x) for x in results["Merge requests"][0]],
             "commits": [asdict(x) for x in results["Commits"][0]],
             "pipelines": [asdict(x) for x in results["Pipelines"][0]],
+            "issues": [asdict(x) for x in results["Issues"][0]],
             "warnings": [r[1] for r in results.values() if r[1]],
         }
 
@@ -1569,6 +1610,12 @@ def pill(text: str, kind: str = "neutral") -> str:
 
 def status_kind(status: str) -> str:
     s = str(status).lower()
+    if s in {"pass", "passed", "ready"}:
+        return "success"
+    if s in {"review", "unknown", "not available"}:
+        return "warning" if s == "review" else "neutral"
+    if s in {"hold", "blocked", "failed"}:
+        return "danger"
     if any(x in s for x in ["done", "closed", "resolved", "complete"]):
         return "success"
     if any(x in s for x in ["block", "cancel"]):
@@ -1749,6 +1796,148 @@ def get_selected_issue(df: pd.DataFrame, key: str):
         return None
     rows = df[df["key"] == key]
     return rows.iloc[0] if not rows.empty else None
+
+
+def build_dashboard_pdf(df: pd.DataFrame, tel: Dict[str, Any], jira_meta: Dict[str, Any]) -> bytes:
+    from io import BytesIO
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    buffer = BytesIO()
+    d = filtered_jira_df(df) if not df.empty else df
+    mr, commits, pipes = gitlab_frames(tel)
+    gl_issues = pd.DataFrame(tel.get("issues", []))
+    scope, gates = release_gate_data(d, mr, pipes, "All loaded work")
+    generated = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    def draw_table(pdf, title: str, frame: pd.DataFrame, columns: List[str], page_size: int = 26):
+        available = [c for c in columns if c in frame.columns]
+        data = frame[available].copy() if available else pd.DataFrame()
+        pages = [data.iloc[i:i + page_size] for i in range(0, len(data), page_size)] or [data]
+        for page_num, page in enumerate(pages, start=1):
+            fig, ax = plt.subplots(figsize=(11.69, 8.27))
+            fig.patch.set_facecolor("white")
+            ax.axis("off")
+            suffix = f" · page {page_num}/{len(pages)}" if len(pages) > 1 else ""
+            ax.set_title(title + suffix, loc="left", fontsize=16, fontweight="bold", pad=18)
+            if page.empty:
+                ax.text(0.02, 0.88, "No records available in the selected data.", fontsize=10)
+            else:
+                def cell(value):
+                    if value is None or (not isinstance(value, (list, dict)) and pd.isna(value)):
+                        return ""
+                    if isinstance(value, (pd.Timestamp, datetime)):
+                        return value.strftime("%Y-%m-%d %H:%M")
+                    text = str(value).replace("\n", " ")
+                    return text if len(text) <= 90 else text[:87] + "..."
+
+                table = ax.table(
+                    cellText=[[cell(value) for value in row] for row in page.itertuples(index=False, name=None)],
+                    colLabels=[COLUMN_LABELS.get(c, c.replace("_", " ").title()) for c in available],
+                    cellLoc="left", colLoc="left", loc="upper left", bbox=[0.01, 0.05, 0.98, 0.84],
+                )
+                table.auto_set_font_size(False)
+                table.set_fontsize(6.5 if len(available) > 6 else 7.5)
+                for (row, _), cell_obj in table.get_celld().items():
+                    if row == 0:
+                        cell_obj.set_facecolor("#123D32")
+                        cell_obj.get_text().set_color("white")
+                        cell_obj.get_text().set_weight("bold")
+                    else:
+                        cell_obj.set_facecolor("#F1F7F3" if row % 2 == 0 else "white")
+            fig.tight_layout()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+    with PdfPages(buffer) as pdf:
+        info = pdf.infodict()
+        info["Title"] = "Engineering Delivery Management Report"
+        info["Author"] = "Engineering Intelligence Hub"
+
+        fig, axes = plt.subplots(2, 2, figsize=(11.69, 8.27))
+        fig.suptitle("Engineering Delivery Report", x=0.06, ha="left", fontsize=22, fontweight="bold")
+        jira_projects = jira_meta.get("project", "Not specified") or "Not specified"
+        repo = tel.get("project_name", "No GitLab repository selected") if tel else "No GitLab repository selected"
+        fig.text(0.06, 0.91, f"Generated {generated} · Jira {jira_projects} · GitLab {repo}", fontsize=9, color="#49645A")
+        kpis = [
+            ("Jira issues", len(d)),
+            ("Open / blocked", f"{int((~d['is_done']).sum())} / {int(d['is_blocked'].sum())}" if not d.empty else "0 / 0"),
+            ("Merge requests", len(mr)),
+            ("Commits / pipelines", f"{len(commits)} / {len(pipes)}"),
+            ("GitLab issues", len(gl_issues)),
+            ("Release gate", "HOLD" if any(g["status"] == "HOLD" for g in gates) else "REVIEW" if any(g["status"] in {"REVIEW", "UNKNOWN"} for g in gates) else "PASS"),
+        ]
+        text = "\n".join(f"{label}:  {value}" for label, value in kpis)
+        axes[0, 0].axis("off")
+        axes[0, 0].text(0, 0.98, "Delivery snapshot", fontsize=13, fontweight="bold", va="top")
+        axes[0, 0].text(0, 0.82, text, fontsize=10, va="top", linespacing=1.8)
+        if not d.empty:
+            status_counts = d["status"].value_counts().head(8)
+            axes[0, 1].barh(status_counts.index[::-1], status_counts.values[::-1], color="#16866A")
+            axes[0, 1].set_title("Jira status distribution")
+            flow = weekly_trend(d)
+            if not flow.empty:
+                for label, group in flow.groupby("Series"):
+                    axes[1, 0].plot(group["week"], group["Issues"], marker="o", linewidth=1.8, label=label)
+                axes[1, 0].legend(frameon=False)
+            axes[1, 0].set_title("Jira created vs completed")
+        else:
+            axes[0, 1].text(0.1, 0.5, "No Jira data", transform=axes[0, 1].transAxes)
+            axes[1, 0].text(0.1, 0.5, "No Jira trend data", transform=axes[1, 0].transAxes)
+        if not mr.empty:
+            mr["state"].value_counts().plot(kind="bar", ax=axes[1, 1], color="#16866A")
+            axes[1, 1].set_title("GitLab merge request states")
+        elif not pipes.empty:
+            pipes["status"].value_counts().plot(kind="bar", ax=axes[1, 1], color="#16866A")
+            axes[1, 1].set_title("GitLab pipeline states")
+        else:
+            axes[1, 1].text(0.1, 0.5, "No GitLab data", transform=axes[1, 1].transAxes)
+        for ax in [axes[0, 1], axes[1, 0], axes[1, 1]]:
+            ax.grid(axis="y", alpha=0.2)
+            ax.tick_params(labelsize=8)
+        fig.tight_layout(rect=[0, 0, 1, 0.88])
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        gate_frame = pd.DataFrame(gates)
+        draw_table(pdf, "Release guardrails · All loaded work", gate_frame, ["gate", "status", "evidence"])
+
+        if not d.empty:
+            membership = sprint_membership(d)
+            sprint_frame = sprint_stats(membership) if not membership.empty else pd.DataFrame()
+            if not sprint_frame.empty:
+                fig, ax = plt.subplots(figsize=(11.69, 5.8))
+                sprint_frame.tail(12).plot(x="sprint", y=["Scope_pts", "Done_pts"], kind="bar", ax=ax,
+                                           color=["#64A8C7", "#16866A"])
+                ax.set_title("Sprint planned vs completed story points")
+                ax.tick_params(axis="x", rotation=35, labelsize=8)
+                ax.grid(axis="y", alpha=0.2)
+                fig.tight_layout()
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+                draw_table(pdf, "Sprint performance", sprint_frame,
+                           ["sprint", "State", "Start", "End", "Issues", "Done", "Carry_over", "Scope_pts", "Done_pts", "Completion"])
+
+        draw_table(pdf, "Jira issue detail", d,
+                   ["key", "summary", "status", "assignee", "priority", "issue_type", "sprint", "story_points", "risk_flags", "updated", "due_date"])
+        draw_table(pdf, "GitLab issue detail", gl_issues,
+                   ["issue_id", "title", "state", "author", "assignees", "labels", "created_at", "updated_at", "due_date"])
+        mr_report = mr.copy()
+        if not mr_report.empty:
+            mr_report["jira_keys"] = mr_report.apply(
+                lambda row: ", ".join(extract_issue_keys(
+                    f"{row.get('title', '')} {row.get('source_branch', '')} {row.get('description', '')}",
+                    jira_project_keys(),
+                )), axis=1,
+            )
+        draw_table(pdf, "GitLab merge request detail", mr_report,
+                   ["mr_id", "title", "state", "author", "reviewers", "created_at", "merged_at", "draft", "has_conflicts", "notes", "jira_keys"])
+        draw_table(pdf, "GitLab commit detail", commits,
+                   ["commit_id", "title", "author", "created_at", "additions", "deletions", "jira_keys"])
+        draw_table(pdf, "GitLab pipeline detail", pipes,
+                   ["pipeline_id", "status", "ref", "source", "created_at", "updated_at", "duration_min"])
+
+    return buffer.getvalue()
 
 
 # =====================================================================
@@ -2748,6 +2937,112 @@ def render_risks(df: pd.DataFrame):
                 csv_download(subset, f"Download {name.lower()} (CSV)", f"{name.lower()}.csv", f"dl_risk_{name}")
 
 
+def release_gate_data(
+    df: pd.DataFrame, mr: pd.DataFrame, pipes: pd.DataFrame, release: str
+) -> Tuple[pd.DataFrame, List[Dict[str, str]]]:
+    if release == "All loaded work":
+        scope = df.copy()
+    else:
+        scope = df[df["fix_versions"].fillna("").apply(lambda value: release in value.split(", "))].copy()
+
+    available = not df.empty
+    open_scope = scope[~scope["is_done"]] if not scope.empty else scope
+    high_priority = open_scope[open_scope["priority"].str.lower().isin(
+        ["highest", "critical", "blocker", "high"]
+    )] if not open_scope.empty else open_scope
+    gates: List[Dict[str, str]] = []
+
+    def add(name: str, result: str, evidence: str) -> None:
+        gates.append({"gate": name, "status": result, "evidence": evidence})
+
+    if available:
+        add("Release scope complete", "PASS" if open_scope.empty else "HOLD",
+            f"{len(open_scope)} open of {len(scope)} scoped Jira issues")
+        blocked = int(scope["is_blocked"].sum())
+        add("No blocked Jira issues", "PASS" if blocked == 0 else "HOLD", f"{blocked} blocked")
+        overdue = int(scope["overdue"].sum())
+        add("No overdue Jira issues", "PASS" if overdue == 0 else "HOLD", f"{overdue} overdue")
+        add("No open high-priority issues", "PASS" if high_priority.empty else "HOLD",
+            f"{len(high_priority)} open high / critical / blocker issues")
+        unestimated = int((~scope["is_done"] & ~scope["has_estimate"]).sum()) if not scope.empty else 0
+        add("Open work estimated", "PASS" if unestimated == 0 else "REVIEW",
+            f"{unestimated} open issues without story points")
+    else:
+        for name in ["Release scope complete", "No blocked Jira issues", "No overdue Jira issues",
+                     "No open high-priority issues", "Open work estimated"]:
+            add(name, "UNKNOWN", "Jira data is not loaded")
+
+    if mr.empty and pipes.empty:
+        add("Merge request review queue clear", "UNKNOWN", "GitLab data is not loaded")
+        add("No merge request conflicts", "UNKNOWN", "GitLab data is not loaded")
+        add("Latest pipeline successful", "UNKNOWN", "GitLab data is not loaded")
+        add("Pipeline success rate at least 90%", "UNKNOWN", "GitLab data is not loaded")
+    else:
+        opened = mr[mr["state"] == "opened"] if not mr.empty else pd.DataFrame()
+        add("Merge request review queue clear", "PASS" if opened.empty else "REVIEW",
+            f"{len(opened)} open merge requests")
+        conflicts = int(opened["has_conflicts"].sum()) if not opened.empty else 0
+        add("No merge request conflicts", "PASS" if conflicts == 0 else "HOLD",
+            f"{conflicts} open merge requests with conflicts")
+        if pipes.empty:
+            add("Latest pipeline successful", "UNKNOWN", "No pipelines loaded")
+            add("Pipeline success rate at least 90%", "UNKNOWN", "No pipelines loaded")
+        else:
+            latest = pipes.sort_values("updated_at").iloc[-1]
+            latest_status = str(latest["status"]).lower()
+            latest_result = "PASS" if latest_status == "success" else "HOLD" if latest_status == "failed" else "REVIEW"
+            add("Latest pipeline successful", latest_result,
+                f"Pipeline #{latest['pipeline_id']} is {latest_status}")
+            success = pipeline_success_rate(pipes)
+            if success is None:
+                add("Pipeline success rate at least 90%", "UNKNOWN", "No completed pipelines loaded")
+            else:
+                result = "PASS" if success >= 90 else "HOLD"
+                add("Pipeline success rate at least 90%", result,
+                    f"{success:.1f}% over {len(pipes[pipes['status'].isin(['success', 'failed'])])} completed pipelines")
+    return scope, gates
+
+
+def render_release_readiness(df: pd.DataFrame):
+    render_hero("Release readiness", "Evidence-based release gates across Jira scope, review and CI.", "Release guardrails")
+    if df.empty:
+        render_empty("No Jira data loaded yet", "Load Jira issues and sync a GitLab repository to evaluate release gates.")
+        return
+
+    all_versions = sorted({version.strip() for value in df["fix_versions"].dropna()
+                           for version in str(value).split(",") if version.strip()})
+    choices = ["All loaded work"] + all_versions
+    release = st.selectbox("Release / fix version", choices, key="release_target")
+    mr, _, pipes = gitlab_frames(active_gitlab())
+    scope, gates = release_gate_data(filtered_jira_df(df), mr, pipes, release)
+    counts = pd.Series([g["status"] for g in gates]).value_counts()
+    holds = int(counts.get("HOLD", 0))
+    reviews = int(counts.get("REVIEW", 0))
+    unknown = int(counts.get("UNKNOWN", 0))
+    overall = "HOLD" if holds else "REVIEW" if reviews or unknown else "PASS"
+    render_alert(f"Overall release status: {overall}",
+                 f"{int(counts.get('PASS', 0))} passed · {reviews} review · {holds} hold · {unknown} unknown", status_kind(overall))
+
+    left, right = st.columns([1.2, 1])
+    with left:
+        with panel("Release guardrails", "HOLD blocks release; REVIEW requires an owner decision; UNKNOWN means evidence is missing"):
+            html_table(pd.DataFrame(gates), height=390)
+    with right:
+        with panel("Gate outcomes", "Current selected release scope"):
+            outcome = counts.rename_axis("status").reset_index(name="Gates")
+            show_chart(donut_chart(outcome, "status", "Gates", center=overall,
+                                   colors={"PASS": T()["tones"]["green"], "REVIEW": T()["tones"]["amber"],
+                                           "HOLD": T()["tones"]["red"], "UNKNOWN": T()["muted"]}))
+
+    section("Selected Jira scope", f"{len(scope)} issue(s) in {release}")
+    if scope.empty:
+        st.info("No Jira issues match this release target. Confirm the fix version or load the project history.")
+    else:
+        visible = scope[~scope["is_done"]].sort_values(["risk_flags", "priority"], ascending=[False, True])
+        html_table(visible[["key", "summary", "status", "assignee", "priority", "fix_versions", "overdue", "is_blocked", "is_stale"]],
+                   height=360, empty="All issues in this release scope are complete.")
+
+
 # =====================================================================
 # 22. ISSUE EXPLORER
 # =====================================================================
@@ -2841,7 +3136,7 @@ def render_issue_explorer(df: pd.DataFrame):
 # 23. ENGINEERING ACTIVITY (GitLab)
 # =====================================================================
 
-GL_DEFAULTS = {"since": "90 days", "mrs": 300, "commits": 500, "pipelines": 200}
+GL_DEFAULTS = {"since": "90 days", "mrs": 500, "commits": 1000, "pipelines": 200, "issues": 200}
 GL_LOOKBACK = {"30 days": 30, "90 days": 90, "180 days": 180, "1 year": 365, "All time": None}
 
 
@@ -2851,10 +3146,11 @@ def sync_gitlab_project(config: AppConfig, pid: int, name: str, settings: Dict[s
     try:
         tel = GitLabService(config).fetch_deep_telemetry(
             pid, max_mrs=settings["mrs"], max_commits=settings["commits"],
-            max_pipelines=settings["pipelines"], since_days=GL_LOOKBACK[settings["since"]],
+            max_pipelines=settings["pipelines"], max_issues=settings["issues"],
+            since_days=GL_LOOKBACK[settings["since"]],
         )
     except Exception as exc:
-        tel = {"merge_requests": [], "commits": [], "pipelines": [], "warnings": [str(exc)]}
+        tel = {"merge_requests": [], "commits": [], "pipelines": [], "issues": [], "warnings": [str(exc)]}
     tel.update(project_id=pid, project_name=name, settings=settings, fetched_at=datetime.now().isoformat(timespec="seconds"))
     cache[pid] = tel
 
@@ -2874,7 +3170,8 @@ def render_engineering(gitlab_projects: List[Dict[str, Any]], config: AppConfig)
 
     gs = st.session_state.get("gl_settings", GL_DEFAULTS)
     seed("w_gl_since", gs["since"]); seed("w_gl_mrs", gs["mrs"])
-    seed("w_gl_commits", gs["commits"]); seed("w_gl_pipes", gs["pipelines"]); seed("w_gl_auto", True)
+    seed("w_gl_commits", gs["commits"]); seed("w_gl_pipes", gs["pipelines"])
+    seed("w_gl_issues", gs.get("issues", 200)); seed("w_gl_auto", True)
 
     c1, c2 = st.columns([4, 1])
     with c1:
@@ -2885,24 +3182,34 @@ def render_engineering(gitlab_projects: List[Dict[str, Any]], config: AppConfig)
         force = st.button("Sync now", type="primary", key="gl_sync")
 
     with st.expander("Fetch settings"):
-        s1, s2, s3, s4, s5 = st.columns(5)
+        s1, s2, s3, s4, s5, s6 = st.columns(6)
         since = s1.selectbox("Look-back", list(GL_LOOKBACK.keys()), key="w_gl_since")
-        n_mrs = s2.number_input("Max merge requests", 50, 2000, step=50, key="w_gl_mrs")
-        n_commits = s3.number_input("Max commits", 100, 5000, step=100, key="w_gl_commits")
+        n_mrs = s2.number_input("Max merge requests", 50, 5000, step=100, key="w_gl_mrs")
+        n_commits = s3.number_input("Max commits", 100, 10000, step=100, key="w_gl_commits")
         n_pipes = s4.number_input("Max pipelines", 50, 2000, step=50, key="w_gl_pipes")
-        auto = s5.checkbox("Auto-sync on switch", key="w_gl_auto")
-    settings = {"since": since, "mrs": int(n_mrs), "commits": int(n_commits), "pipelines": int(n_pipes)}
+        n_issues = s5.number_input("Max issues", 50, 2000, step=50, key="w_gl_issues")
+        auto = s6.checkbox("Auto-sync on switch", key="w_gl_auto")
+    settings = {"since": since, "mrs": int(n_mrs), "commits": int(n_commits),
+                "pipelines": int(n_pipes), "issues": int(n_issues)}
     st.session_state["gl_settings"] = settings
 
     pid = options[selected]
+    previous_pid = st.session_state.get("gitlab_last_selected_project")
     st.session_state["gitlab_active_project"] = pid
+    st.session_state["gitlab_last_selected_project"] = pid
     cache = st.session_state.setdefault("gitlab_cache", {})
 
-    if force or (auto and pid not in cache):
-        with st.spinner(f"Fetching merge requests, commits and pipelines for {selected}…"):
+    cached = cache.get(pid, {})
+    project_changed = previous_pid != pid
+    settings_changed = cached.get("settings") != settings
+    cache_mismatch = cached.get("project_id") != pid
+    if force or (auto and (project_changed or settings_changed or cache_mismatch)):
+        with st.spinner(f"Fetching issues, merge requests, commits and pipelines for {selected}…"):
             sync_gitlab_project(config, pid, selected, settings)
 
     tel = cache.get(pid)
+    if tel and tel.get("project_id") != pid:
+        tel = None
     if not tel:
         render_empty("This repository has not been synced yet", "Select Sync now to load merge requests, commits and pipelines.")
         return
@@ -2910,12 +3217,17 @@ def render_engineering(gitlab_projects: List[Dict[str, Any]], config: AppConfig)
     for w in tel.get("warnings", []):
         st.warning(w)
     mr, commits, pipes = gitlab_frames(tel)
+    issues = pd.DataFrame(tel.get("issues", []))
+    if not issues.empty:
+        for col in ["created_at", "updated_at", "closed_at", "due_date"]:
+            issues[col] = pd.to_datetime(issues[col], errors="coerce")
     used = tel.get("settings", settings)
     st.caption(
         f"{tel['project_name']} · synced {tel['fetched_at'].replace('T', ' ')} · look-back {used['since']} · "
-        f"{len(mr)} MRs · {len(commits)} commits · {len(pipes)} pipelines (all branches)"
+        f"{len(issues)} issues · {len(mr)} MRs · {len(commits)} commits · {len(pipes)} pipelines (all branches)"
     )
-    if len(mr) >= used["mrs"] or len(commits) >= used["commits"]:
+    if (len(issues) >= used.get("issues", 200) or len(mr) >= used["mrs"]
+            or len(commits) >= used["commits"]):
         st.caption("A limit was reached – raise the maximums in Fetch settings and sync again to load older activity.")
 
     merged = mr[mr["state"] == "merged"] if not mr.empty else pd.DataFrame()
@@ -2937,9 +3249,15 @@ def render_engineering(gitlab_projects: List[Dict[str, Any]], config: AppConfig)
         ("Pipeline success", "–" if success is None else f"{success:.0f}%", "Finished pipelines", "green", "⚙"),
         ("Median pipeline time", fmt_hours(pipes["duration_min"].median() / 60) if not pipes.empty else "–", "Created → updated", "teal", "◷"),
     ])
+    kpi_row([
+        ("GitLab issues", len(issues), "Latest updated", "sky", "▦"),
+        ("Open issues", int((issues["state"] == "opened").sum()) if not issues.empty else 0, "Current queue", "amber", "◔"),
+        ("Closed issues", int((issues["state"] == "closed").sum()) if not issues.empty else 0, "Loaded history", "green", "✓"),
+        ("Issues with due date", int(issues["due_date"].notna().sum()) if not issues.empty else 0, "Release tracking", "teal", "◷"),
+    ])
 
     tn = T()["tones"]
-    t_over, t_mr, t_cm, t_ci = st.tabs(["Overview", "Merge requests", "Commits", "Pipelines"])
+    t_over, t_mr, t_cm, t_ci, t_issues = st.tabs(["Overview", "Merge requests", "Commits", "Pipelines", "Issues"])
 
     with t_over:
         a, b = st.columns(2)
@@ -3059,6 +3377,29 @@ def render_engineering(gitlab_projects: List[Dict[str, Any]], config: AppConfig)
             section("Recent pipelines")
             pt = pipes.rename(columns={"status": "pipeline_status"})
             html_table(pt[["pipeline_id", "pipeline_status", "ref", "source", "created_at", "duration_min"]].head(100), height=340)
+
+    with t_issues:
+        if issues.empty:
+            st.info("No GitLab issues found in the selected look-back window.")
+        else:
+            open_issues = issues[issues["state"] == "opened"]
+            a, b = st.columns(2)
+            with a:
+                with panel("Issue status", "Open versus closed project issues"):
+                    states = issues["state"].value_counts().rename_axis("State").reset_index(name="Issues")
+                    show_chart(donut_chart(states, "State", "Issues", center=str(len(issues))))
+            with b:
+                with panel("Open issues by label", "Most common labels in the active queue"):
+                    label_counts = open_issues["labels"].fillna("").str.split(", ").explode()
+                    label_counts = label_counts[label_counts != ""].value_counts().head(10)
+                    if label_counts.empty:
+                        st.caption("No labels on open issues.")
+                    else:
+                        show_chart(hbar_chart(label_counts.rename_axis("Label").reset_index(name="Issues"), "Label", "Issues"))
+            section("Project issue queue", "Latest updated first")
+            cols = ["issue_id", "title", "state", "author", "assignees", "labels", "created_at", "updated_at", "due_date"]
+            html_table(issues.sort_values("updated_at", ascending=False)[cols], height=400)
+            csv_download(issues, "Download GitLab issues (CSV)", "gitlab_issues.csv", "dl_gl_issues")
 
 
 # =====================================================================
@@ -3439,6 +3780,7 @@ def main():
         ],
         "Delivery": [
             st.Page(with_filters(render_delivery_dashboard), title="Delivery Dashboard", icon="📊", url_path="delivery"),
+            st.Page(with_filters(render_release_readiness), title="Release Readiness", icon="🚦", url_path="release-readiness"),
             st.Page(with_filters(render_team_dashboard), title="Team Dashboard", icon="👥", url_path="team"),
             st.Page(with_filters(render_risks), title="Risks & Attention", icon="⚠️", url_path="risks"),
         ],
@@ -3467,6 +3809,27 @@ def main():
             unsafe_allow_html=True,
         )
         st.toggle("Dark mode", key="dark_mode")
+        filter_signature = tuple((name, st.session_state.get(f"filter_{name}", "All")) for name, _, _ in FILTERS)
+        pdf_signature = (
+            meta.get("fetched_at"), tel.get("project_id") if tel else None,
+            tel.get("fetched_at") if tel else None, filter_signature,
+        )
+        if st.button("Build dashboard PDF", key="sidebar_build_pdf", help="Create a report with charts, release gates, and full loaded data tables."):
+            try:
+                with st.spinner("Building the dashboard report…"):
+                    st.session_state["dashboard_pdf"] = build_dashboard_pdf(jira_df, tel, meta)
+                    st.session_state["dashboard_pdf_signature"] = pdf_signature
+                    st.session_state["dashboard_pdf_name"] = f"engineering-report-{datetime.now().strftime('%Y%m%d-%H%M')}.pdf"
+            except Exception as exc:
+                st.error(f"PDF export failed: {exc}")
+        if st.session_state.get("dashboard_pdf_signature") == pdf_signature and st.session_state.get("dashboard_pdf"):
+            st.download_button(
+                "Download dashboard PDF", st.session_state["dashboard_pdf"],
+                file_name=st.session_state.get("dashboard_pdf_name", "engineering-report.pdf"),
+                mime="application/pdf", key="sidebar_download_pdf",
+            )
+        elif st.session_state.get("dashboard_pdf"):
+            st.caption("Data changed. Build a new PDF to include the latest view.")
         if meta and st.button("↻ Refresh Jira", key="sidebar_refresh"):
             try:
                 with st.spinner("Refreshing Jira…"):
@@ -3481,7 +3844,8 @@ def main():
             f'{" · " + meta["fetched_at"][11:16] if meta else ""}<br>'
             f'GitLab repo: <strong>{esc(tel.get("project_name", "none")[:28]) if tel else "none"}</strong><br>'
             f'Merge requests: <strong>{len(tel.get("merge_requests", [])) if tel else 0}</strong><br>'
-            f'Commits: <strong>{len(tel.get("commits", [])) if tel else 0}</strong></div>',
+            f'Commits: <strong>{len(tel.get("commits", [])) if tel else 0}</strong><br>'
+            f'GitLab issues: <strong>{len(tel.get("issues", [])) if tel else 0}</strong></div>',
             unsafe_allow_html=True,
         )
 
